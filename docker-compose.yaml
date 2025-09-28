@@ -1,0 +1,172 @@
+version: '3.8'
+
+services:
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: ops-sentinel-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - ops-sentinel
+
+  # InfluxDB时序数据库
+  influxdb:
+    image: influxdb:2.7
+    container_name: ops-sentinel-influxdb
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password123
+      - DOCKER_INFLUXDB_INIT_ORG=ops-sentinel
+      - DOCKER_INFLUXDB_INIT_BUCKET=metrics
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=ops-sentinel-token-123456789
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ops-sentinel
+
+  # Grafana监控面板
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: ops-sentinel-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+    depends_on:
+      - influxdb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f localhost:3000/api/health && echo 'ready'"]
+      interval: 30s
+      retries: 3
+    networks:
+      - ops-sentinel
+
+  # OpsSentinel核心服务
+  ops-sentinel-core:
+    build:
+      context: .
+      dockerfile: docker/core/Dockerfile
+    container_name: ops-sentinel-core
+    ports:
+      - "8080:8080"
+      - "8090:8090"
+    volumes:
+      - ./configs:/app/configs
+      - ./models:/app/models
+      - /var/log/ops-sentinel:/var/logs
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - INFLUXDB_HOST=influxdb
+      - INFLUXDB_PORT=8086
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=development
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ops-sentinel
+
+  # OpsSentinel代理（指标收集器）
+  ops-sentinel-agent:
+    build:
+      context: .
+      dockerfile: docker/agent/Dockerfile
+    container_name: ops-sentinel-agent
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /dev:/host/dev:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COLLECT_INTERVAL=30s
+      - NODE_NAME=docker-node
+    privileged: true
+    pid: host
+    depends_on:
+      redis:
+        condition: service_healthy
+      ops-sentinel-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ops-sentinel
+
+  # OpsSentinel仪表板
+  ops-sentinel-dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    container_name: ops-sentinel-dashboard
+    ports:
+      - "3001:3000"
+    environment:
+      - API_ENDPOINT=http://ops-sentinel-core:8080
+      - GRAFANA_URL=http://grafana:3000
+    depends_on:
+      ops-sentinel-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ops-sentinel
+
+volumes:
+  redis_data:
+    driver: local
+  influxdb_data:
+    driver: local
+  influxdb_config:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  ops-sentinel:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

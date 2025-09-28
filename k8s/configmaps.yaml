@@ -1,0 +1,238 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ops-sentinel-config
+  namespace: ops-sentinel
+data:
+  app.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      metrics_port: 8090
+    
+    redis:
+      host: "redis-service"
+      port: 6379
+      db: 0
+      timeout: 30
+    
+    influxdb:
+      host: "influxdb-service"
+      port: 8086
+      database: "ops_sentinel"
+      username: "admin"
+      password: "password"
+      timeout: 30
+    
+    kubernetes:
+      in_cluster: true
+      namespace: "ops-sentinel"
+    
+    prediction:
+      model_path: "/models/fault_prediction.h5"
+      batch_size: 32
+      prediction_interval: 300  # 5 minutes
+      history_window: 3600     # 1 hour
+    
+    healing:
+      enabled: true
+      max_concurrent_healings: 5
+      default_timeout: 300
+      dry_run: false
+    
+    monitoring:
+      metrics_retention: "7d"
+      log_level: "INFO"
+      enable_debug: false
+    
+    alerts:
+      webhook_url: "http://alert-manager:9093/api/v1/alerts"
+      slack_webhook: "https://hooks.slack.com/services/xxx"
+      notification_channel: "#ops-alerts"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ops-sentinel-scripts
+  namespace: ops-sentinel
+data:
+  docker-cleanup.sh: |
+    #!/bin/bash
+    # Docker 清理脚本
+    set -e
+    
+    echo "开始清理Docker资源..."
+    
+    # 清理停止的容器
+    docker container prune -f
+    
+    # 清理未使用的镜像
+    if [[ "$1" == "--all" ]]; then
+        docker image prune -a -f
+    else
+        docker image prune -f
+    fi
+    
+    # 清理未使用的网络
+    docker network prune -f
+    
+    # 清理未使用的卷
+    docker volume prune -f
+    
+    echo "Docker清理完成"
+  
+  log-rotate.sh: |
+    #!/bin/bash
+    # 日志轮转脚本
+    set -e
+    
+    LOG_DIRS=("/var/log" "/opt/logs" "/app/logs")
+    MAX_SIZE="100M"
+    DAYS=7
+    
+    echo "开始日志轮转..."
+    
+    for dir in "${LOG_DIRS[@]}"; do
+        if [[ -d "$dir" ]]; then
+            echo "处理目录: $dir"
+            find "$dir" -name "*.log" -size +$MAX_SIZE -exec gzip {} \;
+            find "$dir" -name "*.log.gz" -mtime +$DAYS -delete
+        fi
+    done
+    
+    echo "日志轮转完成"
+  
+  kill-high-cpu-processes.sh: |
+    #!/bin/bash
+    # 终止高CPU使用率进程脚本
+    set -e
+    
+    CPU_THRESHOLD=${1:-80}
+    EXCLUDE_PROCESSES="systemd|kernel|kthread|ksoftirqd"
+    
+    echo "查找CPU使用率超过${CPU_THRESHOLD}%的进程..."
+    
+    # 获取高CPU进程
+    HIGH_CPU_PIDS=$(ps aux --no-headers | awk -v threshold="$CPU_THRESHOLD" -v exclude="$EXCLUDE_PROCESSES" '
+        $3 > threshold && $11 !~ exclude { print $2 }
+    ')
+    
+    if [[ -n "$HIGH_CPU_PIDS" ]]; then
+        echo "发现高CPU进程，正在终止..."
+        echo "$HIGH_CPU_PIDS" | xargs kill -TERM
+        sleep 5
+        echo "$HIGH_CPU_PIDS" | xargs kill -KILL 2>/dev/null || true
+        echo "高CPU进程已终止"
+    else
+        echo "未发现需要终止的高CPU进程"
+    fi
+  
+  collect-heap-dump.sh: |
+    #!/bin/bash
+    # Java堆转储收集脚本
+    set -e
+    
+    APP_NAME=${1:-"java-app"}
+    OUTPUT_DIR=${2:-"/var/dumps"}
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    
+    echo "开始收集Java应用堆转储: $APP_NAME"
+    
+    # 创建输出目录
+    mkdir -p "$OUTPUT_DIR"
+    
+    # 查找Java进程
+    JAVA_PID=$(pgrep -f "$APP_NAME" | head -1)
+    
+    if [[ -n "$JAVA_PID" ]]; then
+        echo "找到Java进程PID: $JAVA_PID"
+        
+        # 生成堆转储
+        DUMP_FILE="$OUTPUT_DIR/heap_dump_${APP_NAME}_${TIMESTAMP}.hprof"
+        jcmd "$JAVA_PID" GC.run_finalization
+        jcmd "$JAVA_PID" VM.gc
+        jmap -dump:format=b,file="$DUMP_FILE" "$JAVA_PID"
+        
+        echo "堆转储已保存到: $DUMP_FILE"
+        
+        # 压缩文件
+        gzip "$DUMP_FILE"
+        echo "堆转储已压缩"
+    else
+        echo "未找到Java应用进程: $APP_NAME"
+        exit 1
+    fi
+  
+  kill-idle-db-connections.sh: |
+    #!/bin/bash
+    # 终止空闲数据库连接脚本
+    set -e
+    
+    IDLE_TIME=${1:-300}  # 默认5分钟
+    DB_HOST=${DB_HOST:-"localhost"}
+    DB_USER=${DB_USER:-"admin"}
+    DB_PASS=${DB_PASS:-"password"}
+    
+    echo "终止空闲超过${IDLE_TIME}秒的数据库连接..."
+    
+    # MySQL连接终止
+    if command -v mysql &> /dev/null; then
+        mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" -e "
+            SELECT CONCAT('KILL ', id, ';') 
+            FROM INFORMATION_SCHEMA.PROCESSLIST 
+            WHERE Command = 'Sleep' 
+            AND Time > $IDLE_TIME 
+            AND User != 'system user';" | tail -n +2 | mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS"
+    fi
+    
+    echo "空闲连接清理完成"
+  
+  remount-storage.sh: |
+    #!/bin/bash
+    # 重新挂载存储脚本
+    set -e
+    
+    MOUNT_POINT=${1:-"/data"}
+    FORCE=${2:-false}
+    
+    echo "重新挂载存储: $MOUNT_POINT"
+    
+    # 检查挂载点
+    if mountpoint -q "$MOUNT_POINT"; then
+        echo "卸载存储: $MOUNT_POINT"
+        if [[ "$FORCE" == "true" ]]; then
+            umount -f "$MOUNT_POINT"
+        else
+            umount "$MOUNT_POINT"
+        fi
+    fi
+    
+    # 重新挂载
+    echo "重新挂载存储..."
+    mount "$MOUNT_POINT"
+    
+    echo "存储重新挂载完成"
+  
+  fsck-repair.sh: |
+    #!/bin/bash
+    # 文件系统检查和修复脚本
+    set -e
+    
+    DEVICE=${1:-"/dev/sdb1"}
+    
+    echo "开始文件系统检查: $DEVICE"
+    
+    # 检查设备是否存在
+    if [[ ! -b "$DEVICE" ]]; then
+        echo "设备不存在: $DEVICE"
+        exit 1
+    fi
+    
+    # 执行文件系统检查
+    echo "执行fsck检查..."
+    fsck -y "$DEVICE" || {
+        echo "文件系统修复完成，可能需要重启"
+        exit 2
+    }
+    
+    echo "文件系统检查完成"

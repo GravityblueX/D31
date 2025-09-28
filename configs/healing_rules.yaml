@@ -1,0 +1,379 @@
+# OpsSentinel 自愈规则配置
+# 定义各种故障场景的自动恢复策略
+
+healing_rules:
+  # CPU高使用率自愈
+  - id: "cpu_high_healing"
+    name: "CPU使用率过高自愈"
+    description: "当CPU使用率超过阈值时自动执行扩容或重启操作"
+    enabled: true
+    priority: 8
+    cooldown_minutes: 15
+    max_executions_per_hour: 3
+    trigger_conditions:
+      metrics.cpu_usage:
+        ">=": 85
+      level: "CRITICAL"
+      type: "CPU_HIGH"
+    actions:
+      - id: "scale_up_cpu_high"
+        type: "scale_up"
+        target: "high-cpu-deployment"
+        timeout: 300
+        retry_count: 2
+        condition: "cpu_usage > 90"
+        parameters:
+          namespace: "default"
+          scale_to: 5
+          current_replicas: 3
+      - id: "restart_service_cpu"
+        type: "restart_service"
+        target: "cpu-intensive-service"
+        timeout: 180
+        condition: "cpu_usage > 95"
+        parameters:
+          namespace: "default"
+          type: "deployment"
+
+  # 内存泄漏自愈
+  - id: "memory_leak_healing"
+    name: "内存泄漏自愈"
+    description: "检测到内存持续增长时自动重启相关服务"
+    enabled: true
+    priority: 9
+    cooldown_minutes: 20
+    max_executions_per_hour: 2
+    trigger_conditions:
+      metrics.memory_usage:
+        ">=": 90
+      level: "CRITICAL"
+      type: "MEMORY_HIGH"
+    actions:
+      - id: "restart_pod_memory"
+        type: "restart_pod"
+        target: "memory-app"
+        timeout: 240
+        parameters:
+          namespace: "default"
+          label_selector: "app=memory-intensive"
+      - id: "clear_system_cache"
+        type: "clear_cache"
+        target: "system"
+        timeout: 60
+        parameters:
+          type: "system"
+      - id: "scale_up_memory"
+        type: "scale_up"
+        target: "memory-app-deployment"
+        timeout: 300
+        condition: "memory_usage > 95"
+        parameters:
+          namespace: "default"
+          scale_to: 4
+
+  # 磁盘空间不足自愈
+  - id: "disk_full_healing"
+    name: "磁盘空间不足自愈"
+    description: "磁盘使用率过高时自动清理临时文件和日志"
+    enabled: true
+    priority: 10
+    cooldown_minutes: 30
+    max_executions_per_hour: 4
+    trigger_conditions:
+      metrics.disk_usage:
+        ">=": 90
+      level: "CRITICAL"
+      type: "DISK_HIGH"
+    actions:
+      - id: "cleanup_temp_files"
+        type: "cleanup_disk"
+        target: "/tmp"
+        timeout: 300
+        parameters:
+          paths: ["/tmp", "/var/log", "/var/cache"]
+          file_age_days: 7
+      - id: "cleanup_docker_images"
+        type: "custom_script"
+        target: "/usr/local/bin/docker-cleanup.sh"
+        timeout: 600
+        parameters:
+          script_path: "/usr/local/bin/docker-cleanup.sh"
+          args: ["--all", "--force"]
+      - id: "rotate_logs"
+        type: "custom_script"
+        target: "/usr/local/bin/log-rotate.sh"
+        timeout: 180
+        parameters:
+          script_path: "/usr/local/bin/log-rotate.sh"
+
+  # 应用无响应自愈
+  - id: "app_unresponsive_healing"
+    name: "应用无响应自愈"
+    description: "应用响应时间过长或错误率过高时重启服务"
+    enabled: true
+    priority: 7
+    cooldown_minutes: 10
+    max_executions_per_hour: 5
+    trigger_conditions:
+      metrics.response_time:
+        ">": 5000  # 5秒
+      metrics.error_rate:
+        ">": 0.1   # 10%
+    actions:
+      - id: "restart_unresponsive_app"
+        type: "restart_service"
+        target: "web-application"
+        timeout: 180
+        parameters:
+          namespace: "default"
+          type: "deployment"
+      - id: "clear_app_cache"
+        type: "clear_cache"
+        target: "app-cache"
+        timeout: 60
+        parameters:
+          type: "redis"
+          host: "redis-service"
+          port: 6379
+          db: 0
+          pattern: "app:cache:*"
+
+  # 数据库连接池耗尽自愈
+  - id: "db_connection_healing"
+    name: "数据库连接池耗尽自愈"
+    description: "数据库连接数过多时重启应用或清理连接"
+    enabled: true
+    priority: 6
+    cooldown_minutes: 15
+    max_executions_per_hour: 3
+    trigger_conditions:
+      metrics.error_rate:
+        ">": 0.05
+      message:
+        contains: "connection"
+    actions:
+      - id: "restart_db_app"
+        type: "restart_pod"
+        target: "database-app"
+        timeout: 300
+        parameters:
+          namespace: "default"
+          label_selector: "tier=backend,component=database"
+      - id: "kill_idle_connections"
+        type: "custom_script"
+        target: "/usr/local/bin/kill-idle-db-connections.sh"
+        timeout: 120
+        parameters:
+          script_path: "/usr/local/bin/kill-idle-db-connections.sh"
+          args: ["--idle-time", "300"]
+
+  # 网络异常自愈
+  - id: "network_issue_healing"
+    name: "网络异常自愈"
+    description: "网络延迟或丢包严重时重启网络服务"
+    enabled: true
+    priority: 5
+    cooldown_minutes: 20
+    max_executions_per_hour: 2
+    trigger_conditions:
+      metrics.network_rx_rate:
+        ">": 1000000000  # 1GB/s异常流量
+      type: "NETWORK_HIGH"
+    actions:
+      - id: "restart_network_service"
+        type: "restart_service"
+        target: "networking"
+        timeout: 300
+        parameters:
+          type: "systemd"
+      - id: "flush_network_cache"
+        type: "custom_script"
+        target: "/usr/local/bin/flush-network-cache.sh"
+        timeout: 60
+
+  # 系统负载过高自愈
+  - id: "high_load_healing"
+    name: "系统负载过高自愈"
+    description: "系统负载持续过高时终止高消耗进程"
+    enabled: true
+    priority: 4
+    cooldown_minutes: 25
+    max_executions_per_hour: 2
+    trigger_conditions:
+      metrics.load_avg_1:
+        ">": 10
+      level: "CRITICAL"
+      type: "LOAD_HIGH"
+    actions:
+      - id: "kill_high_cpu_processes"
+        type: "custom_script"
+        target: "/usr/local/bin/kill-high-cpu-processes.sh"
+        timeout: 180
+        parameters:
+          script_path: "/usr/local/bin/kill-high-cpu-processes.sh"
+          args: ["--cpu-threshold", "80", "--exclude", "systemd,kernel"]
+      - id: "scale_up_workers"
+        type: "scale_up"
+        target: "worker-deployment"
+        timeout: 300
+        condition: "load_avg_1 > 15"
+        parameters:
+          namespace: "default"
+          scale_to: 6
+
+  # Java应用OOM自愈
+  - id: "java_oom_healing"
+    name: "Java应用内存溢出自愈"
+    description: "Java应用发生OOM时收集堆转储并重启"
+    enabled: true
+    priority: 8
+    cooldown_minutes: 30
+    max_executions_per_hour: 1
+    trigger_conditions:
+      message:
+        contains: "OutOfMemoryError"
+      type: "MEMORY_HIGH"
+    actions:
+      - id: "collect_heap_dump"
+        type: "custom_script"
+        target: "/usr/local/bin/collect-heap-dump.sh"
+        timeout: 600
+        parameters:
+          script_path: "/usr/local/bin/collect-heap-dump.sh"
+          args: ["--app", "java-app", "--output", "/var/dumps"]
+      - id: "restart_java_app"
+        type: "restart_pod"
+        target: "java-application"
+        timeout: 300
+        parameters:
+          namespace: "default"
+          label_selector: "app=java-app"
+
+  # 容器异常退出自愈
+  - id: "container_crash_healing"
+    name: "容器异常退出自愈"
+    description: "容器频繁崩溃时执行回滚或配置修复"
+    enabled: true
+    priority: 7
+    cooldown_minutes: 15
+    max_executions_per_hour: 3
+    trigger_conditions:
+      type: "PROCESS_ANOMALY"
+      message:
+        contains: "restart"
+    actions:
+      - id: "rollback_deployment"
+        type: "rollback_deployment"
+        target: "unstable-app"
+        timeout: 300
+        parameters:
+          namespace: "default"
+          revision: "previous"
+      - id: "update_resource_limits"
+        type: "update_config"
+        target: "app-deployment"
+        timeout: 180
+        parameters:
+          namespace: "default"
+          config_type: "deployment"
+          updates:
+            spec.template.spec.containers[0].resources.limits.memory: "1Gi"
+            spec.template.spec.containers[0].resources.limits.cpu: "500m"
+
+  # 存储异常自愈
+  - id: "storage_issue_healing"
+    name: "存储异常自愈"
+    description: "存储I/O异常或挂载失败时重新挂载"
+    enabled: true
+    priority: 6
+    cooldown_minutes: 20
+    max_executions_per_hour: 2
+    trigger_conditions:
+      message:
+        contains: "I/O error"
+      type: "DISK_HIGH"
+    actions:
+      - id: "remount_storage"
+        type: "custom_script"
+        target: "/usr/local/bin/remount-storage.sh"
+        timeout: 300
+        parameters:
+          script_path: "/usr/local/bin/remount-storage.sh"
+          args: ["--mount-point", "/data", "--force"]
+      - id: "check_filesystem"
+        type: "custom_script"
+        target: "/usr/local/bin/fsck-repair.sh"
+        timeout: 600
+        parameters:
+          script_path: "/usr/local/bin/fsck-repair.sh"
+
+  # 服务发现异常自愈
+  - id: "service_discovery_healing"
+    name: "服务发现异常自愈"
+    description: "服务注册或发现失败时重启相关组件"
+    enabled: true
+    priority: 5
+    cooldown_minutes: 10
+    max_executions_per_hour: 4
+    trigger_conditions:
+      message:
+        contains: "service discovery"
+      metrics.error_rate:
+        ">": 0.2
+    actions:
+      - id: "restart_service_mesh"
+        type: "restart_service"
+        target: "istio-proxy"
+        timeout: 180
+        parameters:
+          namespace: "istio-system"
+          type: "deployment"
+      - id: "refresh_dns_cache"
+        type: "custom_script"
+        target: "/usr/local/bin/refresh-dns-cache.sh"
+        timeout: 60
+
+# 全局配置
+global_config:
+  # 自愈总开关
+  healing_enabled: true
+  
+  # 默认超时时间（秒）
+  default_timeout: 300
+  
+  # 默认重试次数
+  default_retry_count: 3
+  
+  # 最大并发自愈任务数
+  max_concurrent_healings: 5
+  
+  # 自愈历史保留天数
+  history_retention_days: 30
+  
+  # 通知配置
+  notifications:
+    enabled: true
+    channels:
+      - type: "webhook"
+        url: "http://alert-manager:9093/api/v1/alerts"
+      - type: "slack"
+        webhook_url: "https://hooks.slack.com/services/xxx"
+        channel: "#ops-alerts"
+  
+  # 安全配置
+  security:
+    # 允许执行的脚本目录
+    allowed_script_paths:
+      - "/usr/local/bin/"
+      - "/opt/ops-scripts/"
+    
+    # 禁止的危险操作
+    forbidden_actions:
+      - "rm -rf /"
+      - "chmod 777"
+      - "chown root"
+    
+    # 需要确认的高风险操作
+    require_confirmation:
+      - "rollback_deployment"
+      - "kill_process"
